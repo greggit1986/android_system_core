@@ -472,7 +472,7 @@ static void StartRebootMonitorThread(unsigned int cmd, const Timer& shutdown_tim
     std::thread reboot_monitor_thread(&RebootMonitorThread, cmd, shutdown_timer);
     reboot_monitor_thread.detach();
 }
-
+#if 0
 static bool UmountDynamicPartitions(const std::vector<std::string>& dynamic_partitions) {
     bool ret = true;
     for (auto device : dynamic_partitions) {
@@ -490,7 +490,7 @@ static bool UmountDynamicPartitions(const std::vector<std::string>& dynamic_part
     }
     return ret;
 }
-
+#endif
 /* Try umounting all emulated file systems R/W block device cfile systems.
  * This will just try umount and give it up if it fails.
  * For fs like ext4, this is ok as file system will be marked as unclean shutdown
@@ -510,60 +510,35 @@ static UmountStat TryUmountAndFsck(unsigned int cmd, bool run_fsck,
     if (run_fsck && !FindPartitionsToUmount(&block_devices, &emulated_devices)) {
         return UMOUNT_STAT_ERROR;
     }
-    bool ota_update_in_progress = false;
-    if (!IsMicrodroid()) {
-        auto sm = snapshot::SnapshotManager::New();
-        if (sm->IsUserspaceSnapshotUpdateInProgress(dynamic_partitions)) {
-            LOG(INFO) << "OTA update in progress. Pause snapshot merge";
-            if (!sm->PauseSnapshotMerge()) {
-                LOG(ERROR) << "Snapshot-merge pause failed";
-            }
-            ota_update_in_progress = true;
-        }
-    }
-    UmountStat stat = UmountPartitions(timeout - t.duration());
-    if (stat != UMOUNT_STAT_SUCCESS) {
-        // Do not delete: Critical log for reboot_fs_integrity_test.
-        KLOG_INFO(LOG_TAG, "umount timeout, last resort, kill all and try");
-        if (DUMP_ON_UMOUNT_FAILURE) DumpUmountDebuggingInfo();
-        // Since umount timedout, we will try to kill all processes
-        // and do one more attempt to umount the partitions.
-        //
-        // However, if OTA update is in progress, we don't want
-        // to kill the snapuserd daemon as the daemon will
-        // be serving I/O requests. Killing the daemon will
-        // end up with I/O failures. If the update is in progress,
-        // we will just return the umount failure status immediately.
-        // This is ok, given the fact that killing the processes
-        // and doing an umount is just a last effort. We are
-        // still not doing fsck when all processes are killed.
-        //
-        if (ota_update_in_progress) {
-            bool umount_dynamic_partitions = UmountDynamicPartitions(dynamic_partitions);
-            LOG(INFO) << "Sending SIGTERM to all process";
-            // Send SIGTERM to all processes except init
-            WriteStringToFile("e", PROC_SYSRQ);
-            // Wait for processes to terminate
-            std::this_thread::sleep_for(1s);
-            // Try one more attempt to umount other partitions which failed
-            // earlier
-            if (!umount_dynamic_partitions) {
-                UmountDynamicPartitions(dynamic_partitions);
-            }
-            return stat;
-        }
-        KillAllProcesses();
-        // even if it succeeds, still it is timeout and do not run fsck with all processes killed
-        UmountStat st = UmountPartitions(0ms);
-        if ((st != UMOUNT_STAT_SUCCESS) && DUMP_ON_UMOUNT_FAILURE) DumpUmountDebuggingInfo();
-    }
 
-    if (stat == UMOUNT_STAT_SUCCESS && run_fsck) {
+    LOG(INFO) << "Terminate all processes unconditionally...";
+    WriteStringToFile("e", PROC_SYSRQ);
+
+    LOG(INFO) << "Is anyone still alive? Kill them!";
+    KillAllProcesses();
+
+    LOG(INFO) << "Now remount all filesystems to RO";
+    WriteStringToFile("u", PROC_SYSRQ);
+
+    LOG(INFO) << "Unmount all partitions";
+    // even if it succeeds, still it is timeout and do not run fsck with all processes killed
+    UmountStat st = UmountPartitions(0ms);
+    if ((st != UMOUNT_STAT_SUCCESS) && DUMP_ON_UMOUNT_FAILURE) DumpUmountDebuggingInfo();
+
+    if (st == UMOUNT_STAT_SUCCESS && run_fsck) {
+        LOG(INFO) << "Pause reboot monitor thread before fsck";
+        sem_post(reboot_semaphore);
+
+        // fsck part is excluded from timeout check. It only runs for user initiated shutdown
+        // and should not affect reboot time.
         for (auto& entry : block_devices) {
             entry.DoFsck();
         }
+
+        LOG(INFO) << "Resume reboot monitor thread after fsck";
+        sem_post(reboot_semaphore);
     }
-    return stat;
+    return st;
 }
 
 // zram is able to use backing device on top of a loopback device.
@@ -821,17 +796,6 @@ static void DoReboot(unsigned int cmd, const std::string& reason, const std::str
         }
     }
 
-    // optional shutdown step
-    // 1. terminate all services except shutdown critical ones. wait for delay to finish
-    if (clean_shutdown_timeout > 0ms) {
-        StopServicesAndLogViolations(stop_first, clean_shutdown_timeout / 2, true /* SIGTERM */);
-    }
-    // Send SIGKILL to ones that didn't terminate cleanly.
-    StopServicesAndLogViolations(stop_first, 0ms, false /* SIGKILL */);
-    SubcontextTerminate();
-    // Reap subcontext pids.
-    ReapAnyOutstandingChildren();
-
     // 3. send volume abort_fuse and volume shutdown to vold
     Service* vold_service = ServiceList::GetInstance().FindService("vold");
     if (vold_service != nullptr && vold_service->IsRunning()) {
@@ -843,8 +807,6 @@ static void DoReboot(unsigned int cmd, const std::string& reason, const std::str
     } else {
         LOG(INFO) << "vold not running, skipping vold shutdown";
     }
-    // logcat stopped here
-    StopServices(kDebuggingServices, 0ms, false /* SIGKILL */);
     // 4. sync, try umount, and optionally run fsck for user shutdown
     {
         Timer sync_timer;
