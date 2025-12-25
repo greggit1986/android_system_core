@@ -526,17 +526,11 @@ static UmountStat TryUmountAndFsck(unsigned int cmd, bool run_fsck,
     if ((st != UMOUNT_STAT_SUCCESS) && DUMP_ON_UMOUNT_FAILURE) DumpUmountDebuggingInfo();
 
     if (st == UMOUNT_STAT_SUCCESS && run_fsck) {
-        LOG(INFO) << "Pause reboot monitor thread before fsck";
-        sem_post(reboot_semaphore);
-
         // fsck part is excluded from timeout check. It only runs for user initiated shutdown
         // and should not affect reboot time.
         for (auto& entry : block_devices) {
             entry.DoFsck();
         }
-
-        LOG(INFO) << "Resume reboot monitor thread after fsck";
-        sem_post(reboot_semaphore);
     }
     return st;
 }
